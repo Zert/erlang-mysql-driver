@@ -16,7 +16,7 @@
 %%% provide a simpler, Mnesia-style transaction interface. Also,
 %%% moved much of the prepared statement handling code to mysql_conn.erl
 %%% and added versioning to prepared statements.
-%%% 
+%%%
 %%%
 %%% Usage:
 %%%
@@ -61,7 +61,7 @@
 %%%     - on error:
 %%%          Reason    = mysql:get_result_reason(MysqlRes)
 %%%         with Reason    = string()
-%%% 
+%%%
 %%% If you just want a single MySQL connection, or want to manage your
 %%% connections yourself, you can use the mysql_conn module as a
 %%% stand-alone single MySQL connection. See the comment at the top of
@@ -87,25 +87,25 @@
 	 start/7,
 	 start/8,
 
-	 connect/7,
 	 connect/8,
 	 connect/9,
+	 connect/10,
 
 	 fetch/1,
-	 fetch/2,
 	 fetch/3,
-	 
-	 prepare/2,
+	 fetch/4,
+
+	 prepare/3,
 	 execute/1,
 	 execute/2,
 	 execute/3,
 	 execute/4,
-	 unprepare/1,
-	 get_prepared/1,
+	 unprepare/2,
 	 get_prepared/2,
+	 get_prepared/3,
 
-	 transaction/2,
 	 transaction/3,
+	 transaction/4,
 
 	 get_result_field_info/1,
 	 get_result_rows/1,
@@ -136,7 +136,7 @@
 
 -record(conn, {
 	  pool_id,      %% atom(), the pool's id
-	  pid,          %% pid(), mysql_conn process	 
+	  pid,          %% pid(), mysql_conn process
 	  reconnect,	%% true | false, should mysql_dispatcher try
                         %% to reconnect if this connection dies?
 	  host,		%% string()
@@ -150,15 +150,15 @@
 -record(state, {
 	  %% gb_tree mapping connection
 	  %% pool id to a connection pool tuple
-	  conn_pools = gb_trees:empty(), 
-	                
+	  conn_pools = gb_trees:empty(),
+
 
 	  %% gb_tree mapping connection Pid
 	  %% to pool id
-	  pids_pools = gb_trees:empty(), 
-	                                 
+	  pids_pools = gb_trees:empty(),
+
 	  %% function for logging,
-	  log_fun,	
+	  log_fun,
 
 
 	  %% maps names to {Statement::binary(), Version::integer()} values
@@ -166,7 +166,7 @@
 	 }).
 
 %% Macros
--define(SERVER, mysql_dispatcher).
+%%-define(SERVER, mysql_dispatcher).
 -define(STATE_VAR, mysql_connection_state).
 -define(CONNECT_TIMEOUT, 5000).
 -define(LOCAL_FILES, 128).
@@ -181,7 +181,7 @@
 	LogFun(?MODULE,?LINE,Level,fun()-> {Msg,[]} end)).
 -define(Log2(LogFun,Level,Msg,Params),
 	LogFun(?MODULE,?LINE,Level,fun()-> {Msg,Params} end)).
-			     
+
 
 log(Module, Line, _Level, FormatFun) ->
     {Format, Arguments} = FormatFun(),
@@ -243,15 +243,21 @@ start(PoolId, Host, Port, User, Password, Database, LogFun, Encoding) ->
 start1(PoolId, Host, Port, User, Password, Database, LogFun, Encoding,
        StartFunc) ->
     crypto:start(),
-    gen_server:StartFunc(
-      {local, ?SERVER}, ?MODULE,
+    gen_server:StartFunc(?MODULE,
       [PoolId, Host, Port, User, Password, Database, LogFun, Encoding], []).
 
 
-%% @equiv connect(PoolId, Host, Port, User, Password, Database, Encoding,
+
+%% @equiv connect(Server, PoolId, Host, Port, User, Password, Database,
 %%	   Reconnect, true)
-connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect) ->
-    connect(PoolId, Host, Port, User, Password, Database, Encoding,
+connect(Server, PoolId, Host, undefined, User, Password, Database, Reconnect) ->
+    connect(Server, PoolId, Host, ?PORT, User, Password, Database, undefined,
+            Reconnect).
+
+%% @equiv connect(Server, PoolId, Host, Port, User, Password, Database, Encoding,
+%%	   Reconnect, true)
+connect(Server, PoolId, Host, Port, User, Password, Database, Encoding, Reconnect) ->
+    connect(Server, PoolId, Host, Port, User, Password, Database, Encoding,
 	    Reconnect, true).
 
 %% @doc Starts a MySQL connection and, if successful, add it to the
@@ -261,7 +267,7 @@ connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect) ->
 %%    User::string(), Password::string(), Database::string(),
 %%    Encoding::string(), Reconnect::bool(), LinkConnection::bool()) ->
 %%      {ok, ConnPid} | {error, Reason}
-connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect,
+connect(Server, PoolId, Host, Port, User, Password, Database, Encoding, Reconnect,
        LinkConnection) ->
     Port1 = if Port == undefined -> ?PORT; true -> Port end,
     Fun = if LinkConnection ->
@@ -270,14 +276,14 @@ connect(PoolId, Host, Port, User, Password, Database, Encoding, Reconnect,
 		  fun mysql_conn:start/8
 	  end,
 
-   {ok, LogFun} = gen_server:call(?SERVER, get_logfun),
+   {ok, LogFun} = gen_server:call(Server, get_logfun),
     case Fun(Host, Port1, User, Password, Database, LogFun,
 	     Encoding, PoolId) of
 	{ok, ConnPid} ->
 	    Conn = new_conn(PoolId, ConnPid, Reconnect, Host, Port1, User,
 			    Password, Database, Encoding),
 	    case gen_server:call(
-		   ?SERVER, {add_conn, Conn}) of
+		   Server, {add_conn, Conn}) of
 		ok ->
 		    {ok, ConnPid};
 		Res ->
@@ -301,7 +307,7 @@ new_conn(PoolId, ConnPid, Reconnect, Host, Port, User, Password, Database,
 		  database = Database,
 		  encoding = Encoding
 		 };
-	false ->                        
+	false ->
 	    #conn{pool_id = PoolId,
 		  pid = ConnPid,
 		  reconnect = false}
@@ -324,13 +330,13 @@ fetch(Query) ->
 %%
 %% @spec fetch(PoolId::atom(), Query::iolist(), Timeout::integer()) ->
 %%   query_result()
-fetch(PoolId, Query) ->
-    fetch(PoolId, Query, undefined).
+fetch(Server, PoolId, Query) ->
+    fetch(Server, PoolId, Query, undefined).
 
-fetch(PoolId, Query, Timeout) -> 
+fetch(Server, PoolId, Query, Timeout) ->
     case get(?STATE_VAR) of
 	undefined ->
-	    call_server({fetch, PoolId, Query}, Timeout);
+	    call_server(Server, {fetch, PoolId, Query}, Timeout);
 	State ->
 	    mysql_conn:fetch_local(State, Query)
     end.
@@ -345,8 +351,8 @@ fetch(PoolId, Query, Timeout) ->
 %%   prepare it again with the newest version.
 %%
 %% @spec prepare(Name::atom(), Query::iolist()) -> ok
-prepare(Name, Query) ->
-    gen_server:cast(?SERVER, {prepare, Name, Query}).
+prepare(Server, Name, Query) ->
+    gen_server:cast(Server, {prepare, Name, Query}).
 
 %% @doc Unregister a statement that has previously been register with
 %%   the dispatcher. All calls to execute() with the given statement
@@ -354,8 +360,8 @@ prepare(Name, Query) ->
 %%   been prepared, nothing happens.
 %%
 %% @spec unprepare(Name::atom()) -> ok
-unprepare(Name) ->
-    gen_server:cast(?SERVER, {unprepare, Name}).
+unprepare(Server, Name) ->
+    gen_server:cast(Server, {unprepare, Name}).
 
 %% @doc Get the prepared statement with the given name.
 %%
@@ -370,10 +376,10 @@ unprepare(Name) ->
 %%
 %% @spec get_prepared(Name::atom(), Version::integer()) ->
 %%   {ok, latest} | {ok, Statement::binary()} | {error, Err}
-get_prepared(Name) ->
-    get_prepared(Name, undefined).
-get_prepared(Name, Version) ->
-    gen_server:call(?SERVER, {get_prepared, Name, Version}).
+get_prepared(Server, Name) ->
+    get_prepared(Server, Name, undefined).
+get_prepared(Server, Name, Version) ->
+    gen_server:call(Server, {get_prepared, Name, Version}).
 
 
 %% @doc Execute a query inside a transaction.
@@ -388,7 +394,7 @@ execute(Name, Params) when is_atom(Name), is_list(Params) ->
 	    {error, not_in_transaction};
 	State ->
 	    mysql_conn:execute_local(State, Name, Params)
-    end;
+    end.
 
 %% @doc Execute a query in the connection pool identified by
 %% PoolId. This function optionally accepts a list of parameters to pass
@@ -398,19 +404,19 @@ execute(Name, Params) when is_atom(Name), is_list(Params) ->
 %%
 %% @spec execute(PoolId::atom(), Name::atom(), Params::[term()],
 %%   Timeout::integer()) -> mysql_result()
-execute(PoolId, Name) when is_atom(PoolId), is_atom(Name) ->
-    execute(PoolId, Name, []).
+execute(Server, PoolId, Name) when is_atom(PoolId), is_atom(Name) ->
+    execute(Server, PoolId, Name, []).
 
-execute(PoolId, Name, Timeout) when is_integer(Timeout) ->
-    execute(PoolId, Name, [], Timeout);
+execute(Server, PoolId, Name, Timeout) when is_integer(Timeout) ->
+    execute(Server, PoolId, Name, [], Timeout);
 
-execute(PoolId, Name, Params) when is_list(Params) ->
-    execute(PoolId, Name, Params, undefined).
+execute(Server, PoolId, Name, Params) when is_list(Params) ->
+    execute(Server, PoolId, Name, Params, undefined).
 
-execute(PoolId, Name, Params, Timeout) ->
+execute(Server, PoolId, Name, Params, Timeout) ->
     case get(?STATE_VAR) of
 	undefined ->
-	    call_server({execute, PoolId, Name, Params}, Timeout);
+	    call_server(Server, {execute, PoolId, Name, Params}, Timeout);
 	State ->
 	      case mysql_conn:execute_local(State, Name, Params) of
 		  {ok, Res, NewState} ->
@@ -436,13 +442,13 @@ execute(PoolId, Name, Params, Timeout) ->
 %%
 %% @spec transaction(PoolId::atom(), Fun::function()) ->
 %%   {atomic, Result} | {aborted, {Reason, {rollback_result, Result}}}
-transaction(PoolId, Fun) ->
-    transaction(PoolId, Fun, undefined).
+transaction(Server, PoolId, Fun) ->
+    transaction(Server, PoolId, Fun, undefined).
 
-transaction(PoolId, Fun, Timeout) ->
+transaction(Server, PoolId, Fun, Timeout) ->
     case get(?STATE_VAR) of
 	undefined ->
-	    call_server({transaction, PoolId, Fun}, Timeout);
+	    call_server(Server, {transaction, PoolId, Fun}, Timeout);
 	State ->
 	    case mysql_conn:get_pool_id(State) of
 		PoolId ->
@@ -453,7 +459,7 @@ transaction(PoolId, Fun, Timeout) ->
 			Other -> {atomic, Other}
 		    end;
 		_Other ->
-		    call_server({transaction, PoolId, Fun}, Timeout)
+		    call_server(Server, {transaction, PoolId, Fun}, Timeout)
 	    end
     end.
 
@@ -465,7 +471,7 @@ get_result_field_info(#mysql_result{fieldinfo = FieldInfo}) ->
     FieldInfo.
 
 %% @doc Extract the Rows from MySQL Result on data received
-%% 
+%%
 %% @spec get_result_rows(MySQLRes::mysql_result()) -> [Row::list()]
 get_result_rows(#mysql_result{rows=AllRows}) ->
     AllRows.
@@ -490,11 +496,6 @@ get_result_reason(#mysql_result{error=Reason}) ->
 %%           InsertId::integer()
 get_result_insert_id(#mysql_result{insertid=InsertId}) ->
     InsertId.
-
-
-connect(PoolId, Host, undefined, User, Password, Database, Reconnect) ->
-    connect(PoolId, Host, ?PORT, User, Password, Database, undefined,
-	    Reconnect).
 
 %% gen_server callbacks
 
@@ -616,7 +617,7 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Info}, State) ->
 		  "received 'DOWN' signal from pid ~p not in my list", [Pid]),
 	    {noreply, State}
     end.
-    
+
 terminate(Reason, State) ->
     LogFun = State#state.log_fun,
     LogLevel = case Reason of
@@ -643,18 +644,18 @@ fetch_queries(PoolId, From, State, QueryList) ->
 
 with_next_conn(PoolId, State, Fun) ->
     case get_next_conn(PoolId, State) of
-	{ok, Conn, NewState} ->    
+	{ok, Conn, NewState} ->
 	    Fun(Conn, NewState);
 	error ->
 	    %% we have no active connection matching PoolId
 	    {reply, {error, {no_connection_in_pool, PoolId}}, State}
     end.
 
-call_server(Msg, Timeout) ->
+call_server(Server, Msg, Timeout) ->
     if Timeout == undefined ->
-	    gen_server:call(?SERVER, Msg);
+	    gen_server:call(Server, Msg);
        true ->
-	    gen_server:call(?SERVER, Msg, Timeout)
+	    gen_server:call(Server, Msg, Timeout)
     end.
 
 add_conn(Conn, State) ->
@@ -662,7 +663,7 @@ add_conn(Conn, State) ->
     erlang:monitor(process, Conn#conn.pid),
     PoolId = Conn#conn.pool_id,
     ConnPools = State#state.conn_pools,
-    NewPool = 
+    NewPool =
 	case gb_trees:lookup(PoolId, ConnPools) of
 	    none ->
 		{[Conn],[]};
@@ -695,7 +696,7 @@ remove_pid_from_lists(Pid, Conns1, Conns2) ->
 	{NewConns1, Conn} ->
 	    {Conn, {NewConns1, Conns2}}
     end.
-    
+
 remove_conn(Pid, State) ->
     PidsPools = State#state.pids_pools,
     case gb_trees:lookup(Pid, PidsPools) of
